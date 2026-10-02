@@ -1,23 +1,27 @@
-"""Phase 2 验收测试：工具行为 / 观察驱动轨迹 / schema 可序列化。
+"""Phase 2 验收测试：工具行为 / 端到端 Loop / schema 可序列化。
 
 运行: uv run pytest tests -q
+（端到端那组需要 API key 与网络；未配置时自动跳过，不影响其余测试。）
 
 覆盖三类断言：
     1. 工具函数本身（纯函数，可直接测）——正常路径 + 每一条「错误当观察」分支；
-    2. Loop 的五步观察驱动轨迹——Mock 每步决策都依赖轨迹内容；
-    3. 工具 manifest 是可 JSON 序列化的合法声明（将来 bind_tools 的前提）。
+    2. 真模型端到端——图能终止、工具真被调用、产物就位（只断言结构，不断言措辞）；
+    3. 工具 schema 的「暴露边界」——发给 LLM 的那份里必须没有注入参数。
 """
 
 import json
 from pathlib import Path
 
-from langchain_core.messages import HumanMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from lexaudit.graph import build_graph
-from lexaudit.runtime import MockLLM
-from lexaudit.tools.crossref import TOOL_CLAUSE_CROSS_REF, clause_cross_ref
-from lexaudit.tools.parse import TOOL_PARSE_DOCUMENT, parse_document
-from lexaudit.tools.read import TOOL_READ_CLAUSE, read_clause
+from lexaudit.llm import SYSTEM_PROMPT, build_llm
+from lexaudit.tools import TOOLS, TOOL_NAMES
+from lexaudit.tools.crossref import clause_cross_ref, clause_cross_ref_tool
+from lexaudit.tools.parse import parse_document, parse_document_tool
+from lexaudit.tools.read import read_clause, read_clause_tool
 
 TEXT = """甲方：星辰科技有限公司
 乙方：李某
@@ -88,57 +92,127 @@ class TestClauseCrossRef:
         assert "没有引用其他条款" in obs
 
 
-class TestObservationDrivenLoop:
-    def test_five_step_trajectory_and_final_report(self):
-        """Mock 的五步决策轨迹：每步依据轨迹内容，最终给出引用错位的结论。
+class TestLiveAgentLoop:
+    """真模型端到端：只断言「由代码保证」的结构，不断言模型的措辞与步数。
 
-        断言的是完整轨迹的**顺序**（这是「观察驱动」的行为证据）：
-        parse → read(第六条) → cross_ref(第六条) → read(第十条) → 收尾。
+    为什么不检查具体步骤与文字：真模型是概率性的——实测同一份合同，它会一轮并行发起
+    8 个工具调用、自行挑选要读的条款、中间回复甚至先用英文。拿这些写断言等于自找 flaky。
+    稳定可断言的是：图能终止、工具真被调用、State.parsed 就位、结尾是纯文本收尾。
+    """
+
+    def test_end_to_end_structure(self):
+        """跑完整图，验证「模型能驱动这张图跑出正确产物」。
+
+        未配置 API key 时自动跳过（而非失败）——这样没有凭证的环境不会因此变红。
         """
+        try:
+            llm = build_llm()
+        except RuntimeError as exc:
+            pytest.skip(f"未配置真实模型：{exc}")
+
         sample = Path(__file__).resolve().parents[1] / "samples" / "contract_labour.md"
         state = {
-            "messages": [HumanMessage(content="请审查这份劳动合同。")],
+            "messages": [HumanMessage(content="请审查这份劳动合同，指出存在的问题。")],
             "contract_text": sample.read_text(encoding="utf-8"),
         }
-        result = build_graph(MockLLM()).invoke(state)
+        result = build_graph(llm, SYSTEM_PROMPT).invoke(state, config={"recursion_limit": 25})
         msgs = result["messages"]
 
-        # 轨迹形态：human, (ai, tool) × 4, ai
-        assert [m.type for m in msgs] == ["human", "ai", "tool", "ai", "tool", "ai", "tool", "ai", "tool", "ai"]
-        calls = [m.tool_calls[0] for m in msgs if m.type == "ai" and m.tool_calls]
-        assert [c["name"] for c in calls] == [
-            "parse_document",
-            "read_clause",
-            "clause_cross_ref",
-            "read_clause",
-        ]
-        # 第 3 步的验证对象跟随引用链：读了第六条，再读第十条
-        assert calls[1]["args"]["number"] == "第六条"
-        assert calls[3]["args"]["number"] == "第十条"
-        # 收尾结论来自观察内容（不是硬编码），且 State.parsed 已就位（程序视角数据）
-        assert "引用错位" in msgs[-1].content
-        assert result.get("parsed") is not None
+        # 图必须终止：最后一条是纯文本收尾（若仍带 tool_calls，说明环没退出）
+        assert msgs[-1].type == "ai"
+        assert not msgs[-1].tool_calls
+        # 工具必须真被调用过，观察也已回到轨迹里
+        assert any(m.type == "tool" for m in msgs)
+        # 第一个工具调用必须是 parse_document——system prompt 的硬要求，也是后续工具的前提
+        first_call = next(m for m in msgs if m.type == "ai" and m.tool_calls)
+        assert first_call.tool_calls[0]["name"] == "parse_document"
+        # 程序视角数据必须就位——这才是工具「两种归宿」的真正验收点
+        assert result["parsed"] is not None
         assert len(result["parsed"].clauses) == 10
 
 
-class TestToolManifests:
-    def test_manifests_are_json_serializable_function_call_format(self):
-        """工具清单必须能序列化为 JSON——这是 bind_tools 发给真模型的前提条件。"""
-        for manifest in (TOOL_PARSE_DOCUMENT, TOOL_READ_CLAUSE, TOOL_CLAUSE_CROSS_REF):
-            dumped = json.dumps(manifest, ensure_ascii=False)
-            payload = json.loads(dumped)
+class TestToolSchemas:
+    """锁定「工具声明的暴露边界」——Phase 3 从手写 manifest 换成 @tool 后的新断言。"""
+
+    def test_injected_state_is_hidden_from_llm_schema(self):
+        """发给 LLM 的 schema（tool_call_schema）必须剔除注入参数。
+
+        ⚠️ 关键区分：`args_schema` 是「完整输入」（含注入参数），
+        `tool_call_schema` 才是「真正发给 LLM 的那份」——验证时用错属性会误判成
+        「框架没剔除」，这条测试把这个坑钉死。
+
+        环境数据（contract_text / parsed）与 tool_call_id 若出现在菜单里，
+        LLM 只能幻觉一个值填进去——这正是「数据不经过 LLM」要防的事。
+        """
+        assert "number" in read_clause_tool.tool_call_schema.model_fields
+        assert "parsed" not in read_clause_tool.tool_call_schema.model_fields
+        assert "contract_text" not in parse_document_tool.tool_call_schema.model_fields
+        assert "tool_call_id" not in parse_document_tool.tool_call_schema.model_fields
+
+    def test_injected_value_beats_forged_llm_argument(self):
+        """安全语义：LLM 在 args 里伪造注入参数，运行时注入值优先。
+
+        这层防伪造是官方机制免费提供的——自己实现要在每个工具里重复写一遍。
+        验证方式：让 Mock 在 read_clause 的 args 里塞一个假 parsed，
+        若假值生效，工具会对字符串取 .clauses 而报错；观察里出现真实条款正文，
+        即证明注入值赢了。
+        """
+
+        class ForgingMockLLM:
+            """两步：parse_document 后，发起一次带伪造 parsed 参数的 read_clause。"""
+
+            def invoke(self, messages):
+                if not any(m.type == "tool" for m in messages):
+                    return AIMessage(
+                        content="先解析。",
+                        tool_calls=[{"name": "parse_document", "args": {}, "id": "f1"}],
+                    )
+                if sum(1 for m in messages if m.type == "tool") < 2:
+                    return AIMessage(
+                        content="伪造 parsed 试试。",
+                        tool_calls=[
+                            {
+                                "name": "read_clause",
+                                "args": {"number": "第六条", "parsed": "LLM伪造的假数据"},
+                                "id": "f2",
+                            }
+                        ],
+                    )
+                return AIMessage(content="完成。")
+
+        sample = Path(__file__).resolve().parents[1] / "samples" / "contract_labour.md"
+        result = build_graph(ForgingMockLLM()).invoke(
+            {
+                "messages": [HumanMessage(content="审查")],
+                "contract_text": sample.read_text(encoding="utf-8"),
+            }
+        )
+        observations = [m.content for m in result["messages"] if m.type == "tool"]
+        assert any("保密" in o for o in observations), "真实条款正文未出现 → 伪造值可能覆盖了注入值"
+        assert not any("LLM伪造的假数据" in o for o in observations)
+
+    def test_menu_exports_clean_openai_schema(self):
+        """菜单可导出为 OpenAI function 格式，且参数里只有 LLM 该填的东西。"""
+        for t in TOOLS:
+            payload = json.loads(json.dumps(convert_to_openai_tool(t), ensure_ascii=False))
             assert payload["type"] == "function"
-            assert payload["function"]["name"]
+            assert payload["function"]["name"] == t.name
             assert payload["function"]["description"]
             assert payload["function"]["parameters"]["type"] == "object"
 
-    def test_manifests_match_available_tools_whitelist(self):
-        """白名单与 manifest 一致：防止「声明了但派发不了」或「能派发但没声明」的漂移。"""
-        from lexaudit.graph import AVAILABLE_TOOLS
+    def test_whitelist_is_derived_from_registry(self):
+        """白名单由注册表派生（唯一真相来源），不再是两处手写后靠测试锁一致。"""
+        assert TOOL_NAMES == tuple(t.name for t in TOOLS)
+        assert set(TOOL_NAMES) == {"parse_document", "read_clause", "clause_cross_ref"}
 
-        declared = {
-            TOOL_PARSE_DOCUMENT["function"]["name"],
-            TOOL_READ_CLAUSE["function"]["name"],
-            TOOL_CLAUSE_CROSS_REF["function"]["name"],
-        }
-        assert declared == set(AVAILABLE_TOOLS)
+    def test_description_is_short_not_full_docstring(self):
+        """给 LLM 的 description 必须是精炼短句，不能是整段中文长注释。
+
+        官方 @tool 默认拿整段 docstring 当 description；本项目 docstring 是写给人看的
+        （职责+参数+返回+为什么），直接沿用会把几百字塞进模型上下文（实测过：parse_document
+        的菜单里出现了 500+ 字）。所以三个工具都显式传了 description=——
+        这条测试防止将来有人把它删掉（删了不报错，只会静默污染 prompt）。
+        """
+        for t in TOOLS:
+            assert len(t.description) < 120, f"{t.name} 的 description 过长，可能用了整段 docstring"
+            assert "参数:" not in t.description  # 长注释的特征字样不该出现在给 LLM 的描述里

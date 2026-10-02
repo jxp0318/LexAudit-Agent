@@ -12,3 +12,6 @@ archive/
 
 # WorkBuddy 项目记忆（会话内部数据）
 .workbuddy/
+
+# 本地凭证（真实 API key，绝不进版本库）
+.env

@@ -2,9 +2,9 @@
 
 运行: uv run pytest tests -q
 
-测试隔离原则：本文件锁定 **Phase 1 定义的行为**，所以用一个「单步 Mock」（本地定义），
-而不是复用 runtime 里不断演进的 MockLLM——否则每次升级 Mock 剧本，历史阶段的测试都会被动跟着改，
-测试就失去了「行为锚点」的意义。后续阶段的 Mock 行为由各自阶段的测试文件锁定。
+测试隔离原则：本文件锁定 **Phase 1 定义的行为**，所以用一个「单步替身」（本地定义）。
+真实模型是概率性的，给不了稳定的行为锚点；测试要的是「同一个输入，永远同样的轨迹」。
+后续阶段的行为由各自阶段的测试文件锁定。
 """
 
 import pytest
@@ -114,12 +114,18 @@ class TestAgentLoop:
         """LLM 调了不存在的工具：图不崩溃，错误文本作为观察返回，LLM 下一步收尾。
 
         这是「错误当观察」（蓝图 §7）的行为锚定，也是 Phase 7 失败恢复的地基。
+
+        Phase 3 起这条护栏由官方 ToolNode 接管（原来是手写 tools_node 的 else 分支）：
+        行为契约不变——错误仍是 ToolMessage、图仍不崩；只是错误文案改由框架产出。
+        断言因此改为检查框架文案的关键特征，并额外验证它列出了可用工具
+        （这比我们原来手写的「可用工具：…」更完备）。
         """
         graph = build_graph(BadToolMockLLM())
         result = graph.invoke(_initial_state(SAMPLE_TEXT))
         msgs = result["messages"]
         assert [m.type for m in msgs] == ["human", "ai", "tool", "ai"]
-        assert "不存在" in msgs[2].content  # 观察是错误说明文本
+        assert "is not a valid tool" in msgs[2].content  # 框架产出的错误观察
+        assert "parse_document" in msgs[2].content  # 附带可用工具列表 → 引导下一步
         assert msgs[3].content.startswith("好的")  # "LLM"看到了错误并正常收尾
 
 

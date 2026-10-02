@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "LexAudit —— 基于 LangGraph 的合同审查 Plan-and-Execute Agent（学习型重建）"
 requires-python = ">=3.11"
 dependencies = [
+    "langchain-openai>=1.6.7",
     "langgraph>=0.2",
     "pydantic>=2",
+    "python-dotenv>=1.2.4",
 ]
 
 [dependency-groups]

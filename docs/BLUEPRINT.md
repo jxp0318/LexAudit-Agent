@@ -1,43 +1,111 @@
 # LexAudit Agent — 项目蓝图（Phase 0 产出）
 
-> 本文是删库重开后的第一份产出：**只做分析与设计，不含任何业务代码**。
-> 旧 MVP（已完成并验证）已归档于 `archive/pre-rewrite-2026-10-02/`，其 `docs/ARCHITECTURE.md`
+> 本文是删库重开后的第一份产出：**只做分析与设计，不含任何业务代码**。  
+> 旧 MVP（已完成并验证）已归档于 `archive/pre-rewrite-2026-10-02/`，其 `docs/ARCHITECTURE.md`  
 > 中的技术决策记录（D1~D7）与踩坑清单是重建过程的"答案库"，决策依据直接复用，不凭空另起炉灶。
 >
 > 图例约定：🧱 = 代码预先决定（Workflow 侧）　🤖 = LLM 运行时决定（Agent 侧）
 
 ---
 
+## 首要原则（2026-10-02 追加）：框架优先，不重复造轮子
+
+> 用户明确要求：**凡是 LangGraph / LangChain 已经提供的能力，一律直接用，不再手写。**  
+> 本条优先级高于本文件其余部分——若与旧表述冲突，**以本条为准**。
+
+**判定流程**（遇到任何"这块要不要自己写"时按此走）：
+
+```
+某能力需要实现
+      │
+      ▼
+框架里有现成的吗？
+      ├──有──────→ 直接用（先读一遍源码/文档或做最小实验，确认行为与边界）
+      ├──部分有──→ 用官方组件覆盖主干，在它外面包一层薄封装，只补它不做的部分
+      └──没有────→ 自己写（尽量写成小而纯、可单测的函数）
+```
+
+**为什么改**（理由比"少写代码"更重要）：
+
+1. **作品集信号**：面试官看到"手写了一个已有官方实现的组件"，第一反应不是"他真懂"，而是  
+   "他不知道有这个 API"或"喜欢重复造轮子"——这是**负分**。熟练使用生态标准件，反而是工程成熟度的体现。
+2. **维护成本**：自建组件要自己维护、自己写测试、自己修 bug；官方组件有文档、有社区、有版本演进。
+3. **学习目标不变，只换了达成方式**：从"手写一遍来理解"改为"**会用 + 能解释它的内部机制**"。  
+   后者在面试中同样成立，甚至更贴近真实工作场景。
+
+**框架已提供、本项目直接用的清单**（随阶段补充）：
+
+| 能力                                | 框架组件                                      | 替换掉的自建方案                  | 引入阶段       |
+| --------------------------------- | ----------------------------------------- | ------------------------- | ---------- |
+| 工具定义 + schema 生成                  | `@tool`（`langchain_core.tools`）           | 手写 manifest dict          | Phase 3    |
+| 环境数据注入（不进 LLM schema、防伪造）         | 单字段：`Annotated[..., InjectedState("字段")]`；多字段：`ToolRuntime`（统一入口） | 自建 `ToolContext` 手工传参     | Phase 3 / 4 |
+| tool_call → 执行 → `ToolMessage` 回填 | `ToolNode`（`langgraph.prebuilt`）          | 手写 `tools_node` 的 if/elif | Phase 3    |
+| 工具参数预校验（可选）                       | `ValidationNode`                          | 手写 `model_validate`       | Phase 3 评估 |
+| 消息追加合并                            | `add_messages` reducer                    | —（Phase 1 已用）             | ✅          |
+| 图级并行 fan-out                      | `Send`                                    | 节点内 asyncio               | Phase 5    |
+| 工具内更新 State / 路由                  | `Command`                                 | 手工塞返回值                    | Phase 5/6  |
+| 轨迹持久化 / 断点续跑 / HITL               | `Checkpointer`（`SqliteSaver`）             | 自己存 JSON                  | Phase 8    |
+| 结构化输出                             | `with_structured_output`                  | 手写 JSON 解析                | Phase 5    |
+| 流式执行轨迹                            | `graph.stream(stream_mode=...)`           | —（已用）                     | ✅          |
+| 检索 / 向量接口                         | `langchain_core.retrievers` / vectorstore | 自建检索接口                    | Phase 4 评估 |
+
+**框架不提供、必须自建的清单**（这些才是本项目的"真代码"，也是面试的差异化所在）：
+
+| 能力                                 | 为什么框架给不了                                              |
+| ---------------------------------- | ----------------------------------------------------- |
+| 重规划触发器（读哪些信号、何时回 plan）             | 业务策略；框架只提供"条件边"这个机制，判据得自己定                            |
+| diff 式增量重规划（只追加、不重排已完成）            | Plan-and-Execute 的业务语义                                |
+| **规划期**工具白名单校验                     | 官方 `ValidationNode`/`ToolNode` 都在**执行期**校验；规划期拦截是业务需求 |
+| 任务 DAG 环检测 / 就绪判定                  | 业务数据结构                                                |
+| 审查/检索工具本体、报告渲染与覆盖率                 | 领域逻辑                                                  |
+| 三版本对照评测（固定 workflow / 本方案 / 裸 LLM） | 项目评测方法                                                |
+
+**"用"不等于"黑盒"（学院侧纪律，必须遵守）**：  
+每引入一个框架组件，必须在 `docs/INTERVIEW_QA.md` 里回答三问——  
+① **它替我做了什么？** ② **不用它我得自己写什么？** ③ **它在什么情况下会不够用 / 需要绕开？**  
+—— 用之前至少读一遍源码或用最小实验验证行为。本项目的范本：Phase 2 收尾对 `InjectedState` 的实证，  
+意外发现 `args_schema` ≠ `tool_call_schema`、以及注入参数对 LLM 伪造的免疫性。
+
+**对既有阶段的影响**：
+
+- **Phase 1/2 已完成的手写**（`tools_node`、手写 manifest）**不回头重写**——已通过测试并提交，  
+  是理解机制的"地基标本"；Phase 3 会用官方组件**替换**它们，替换过程本身就是最好的对照教学。
+- **Phase 3 方案随之确定**：原"方案 A：自建 Registry"**作废**，改为——  
+  **官方 `@tool` + `InjectedState` + `ToolNode`，外加一层薄白名单（只管规划期校验）**，  
+  即此前讨论的"**方案 C**"。这层薄白名单**不算重复造轮子**，因为它补的正是框架不提供的规划期校验。
+
+---
+
 ## 1. 项目目标
 
-**产品目标**：LexAudit —— 合同智能审查 Agent。输入一份合同 + 审查要求，输出带原文定位、
+**产品目标**：LexAudit —— 合同智能审查 Agent。输入一份合同 + 审查要求，输出带原文定位、  
 风险等级、修订建议的结构化审查报告。
 
-**求职目标**：第二个作品集项目。与项目一（电商问数，固定 workflow）构成对照——
+**求职目标**：第二个作品集项目。与项目一（电商问数，固定 workflow）构成对照——  
 项目一回答"流程确定时如何做到可控"，本项目回答"流程不确定时如何让 Agent 自主规划并执行"。
 
-**学习目标**：每个技术决策都能回答三问——**解决什么问题 / 为什么现在需要它 / 不用它会怎样**。
+**学习目标**：每个技术决策都能回答三问——**解决什么问题 / 为什么现在需要它 / 不用它会怎样**。  
 最终能向面试官完整讲清 Agent Loop、State、Tool Calling、Planning、Re-planning 的设计与取舍。
 
 ## 2. 用户使用场景
 
-- **场景 A（主）**：用户上传合同（md/docx）+ 自然语言审查要求（"帮我看这份采购合同有什么风险"）
+- **场景 A（主）**：用户上传合同（md/docx）+ 自然语言审查要求（"帮我看这份采购合同有什么风险"）  
   → Agent 自主生成审查计划 → 逐项/并行执行检查 → 执行中发现新证据时调整计划 → 输出审查报告。
 - **场景 B**：指定关注点审查（"只看违约责任和争议解决条款"）→ 计划应相应收窄。
 - **边界**：辅助审查工具，输出非法律意见（免责声明写入报告）；不处理真实在办案件。
 
 ## 3. 核心功能
 
-| 功能 | 说明 | 引入阶段 |
-|---|---|---|
-| 文档解析 | 合同 → 条款树（编号/标题/层级/原文） | Phase 1 |
-| 风险识别 | 缺失条款 / 有毒条款 / 交叉引用错误 / 金额日期不一致 | Phase 2~5 |
-| 审查要点检索（RAG） | 给 LLM 提供可评测的审查依据 | Phase 4 |
-| 自主规划 + 重规划 | 任务 DAG 运行时生成、按发现增量调整 | Phase 5~6 |
-| 反思与失败恢复 | 结果质量校验、工具错误自愈 | Phase 7 |
-| 报告生成 | 结构化 md/json + 审查覆盖率 | Phase 5+ |
-| HTTP API | FastAPI 薄适配层 | Phase 9 |
-| 三版本评测 | 固定 workflow / Plan-Execute / 裸 LLM 对比 | Phase 10 |
+| 功能          | 说明                                    | 引入阶段      |
+| ----------- | ------------------------------------- | --------- |
+| 文档解析        | 合同 → 条款树（编号/标题/层级/原文）                 | Phase 1   |
+| 风险识别        | 缺失条款 / 有毒条款 / 交叉引用错误 / 金额日期不一致        | Phase 2~5 |
+| 审查要点检索（RAG） | 给 LLM 提供可评测的审查依据                      | Phase 4   |
+| 自主规划 + 重规划  | 任务 DAG 运行时生成、按发现增量调整                  | Phase 5~6 |
+| 反思与失败恢复     | 结果质量校验、工具错误自愈                         | Phase 7   |
+| 报告生成        | 结构化 md/json + 审查覆盖率                   | Phase 5+  |
+| HTTP API    | FastAPI 薄适配层                          | Phase 9   |
+| 三版本评测       | 固定 workflow / Plan-Execute / 裸 LLM 对比 | Phase 10  |
 
 ## 4. 整体架构
 
@@ -48,19 +116,21 @@ api/                FastAPI 薄适配层（只做 HTTP 进出翻译，不含业�
      ├─ nodes/       planner / executor / observer / reflector / reporter
      ├─ tools/       工具实现 + 注册表（白名单）
      ├─ rag/         审查要点库 + 检索
-     ├─ runtime.py   LLM 注入点（MockLLM ↔ 真实模型一键切换）
+     ├─ llm.py       LLM 接入层（OpenAI 兼容协议，环境变量配置厂商与模型）
      └─ state.py     State schema + reducer
 ```
 
 三条架构原则：
+
 1. **依赖方向单向**：api → core，core 永不 import api。为什么：core 必须能被测试、CLI、评测直接调用。
 2. **图拓扑静态**：动态性来自"State 里的 plan + 条件边读 State 路由"（详见 §5、§8）。🧱
-3. **LLM 一律经 runtime 注入**：测试期用 MockLLM。为什么：不花钱、可离线、可精确断言
-   （如断言"不同合同类型产出不同 DAG"，守住"非伪动态"）。
+3. **LLM 一律经注入进入图**：`agent_node` 收的是 langchain 的 `Runnable`（只要求有 invoke），  
+   所以换模型不改图。为什么：同一张图能换模型跑出多个版本——Phase 10 的三版本对比靠它；  
+   测试里注入自备替身，也能锁定"不同合同类型产出不同 DAG"这类行为（守住"非伪动态"）。
 
 ## 5. Agent Loop
 
-先纠正一个直觉：**LangGraph 里没有 while 循环**。Agent Loop = "节点函数 + 条件边"构成的
+先纠正一个直觉：**LangGraph 里没有 while 循环**。Agent Loop = "节点函数 + 条件边"构成的  
 状态机循环——执行到某节点后，条件边函数决定下一步去哪，直到走到 END。
 
 ```
@@ -72,42 +142,42 @@ analyze → plan → schedule ⇄ execute → observe(=replan_check)
 
 - **Workflow 侧 🧱**：节点集合、边集合、循环退出条件、最大步数、reducer 合并方式——编译期写死。
 - **Agent 侧 🤖**：plan 的内容（生成什么任务）、每个任务的分析结论、重规划时追加什么任务。
-- **面试标准表述**："图是静态的，执行序列由运行时 State 中的 plan 驱动——这是状态驱动的
+- **面试标准表述**："图是静态的，执行序列由运行时 State 中的 plan 驱动——这是状态驱动的  
   调度循环，不是运行时动态生成的图。"这句话本身就是对图执行模型理解的证明。
 
 ## 6. State 设计
 
 State 是全图唯一的共享黑板，一切动态性都存在这里。**写入纪律比字段本身更重要**（并行正确性的根）：
 
-| 字段 | 类型 | 谁写 | 写入纪律 |
-|---|---|---|---|
-| document_text / clause_tree | str / ClauseTree | ingest 🧱 | 只写一次 |
-| contract_profile | Profile | analyze 🤖 | 顺序节点独占写 |
-| plan（任务 DAG） | Plan | plan/replan 🤖 | **只能由顺序节点写**，并行 executor 绝不碰 |
-| findings | list（reducer: add） | execute 🤖 | 并行 executor 只写 reducer 字段 |
-| completed_task_ids | list（reducer: add） | execute 🧱 | 同上 |
-| evidence_queue | list（reducer: add） | execute 🤖 | 新证据（缺附件/阴阳条款）经此传给 planner |
-| events | list（reducer: add） | 所有节点 | 审计轨迹：覆盖率统计与调试都靠它 |
-| replan_count / step_count | int | observer 🧱 | 死循环防护计数器 |
+| 字段                          | 类型                 | 谁写             | 写入纪律                         |
+| --------------------------- | ------------------ | -------------- | ---------------------------- |
+| document_text / clause_tree | str / ClauseTree   | ingest 🧱      | 只写一次                         |
+| contract_profile            | Profile            | analyze 🤖     | 顺序节点独占写                      |
+| plan（任务 DAG）                | Plan               | plan/replan 🤖 | **只能由顺序节点写**，并行 executor 绝不碰 |
+| findings                    | list（reducer: add） | execute 🤖     | 并行 executor 只写 reducer 字段    |
+| completed_task_ids          | list（reducer: add） | execute 🧱     | 同上                           |
+| evidence_queue              | list（reducer: add） | execute 🤖     | 新证据（缺附件/阴阳条款）经此传给 planner    |
+| events                      | list（reducer: add） | 所有节点           | 审计轨迹：覆盖率统计与调试都靠它             |
+| replan_count / step_count   | int                | observer 🧱    | 死循环防护计数器                     |
 
-**为什么 findings 必须带 reducer**：多个并行 executor 同时返回写 state，普通字段会触发
-写冲突（InvalidUpdateError）；reducer（`operator.add`）把并发更新定义为"追加合并"。
-**为什么 plan 不能用 reducer**：计划需要"整表替换"语义而非追加，且 DAG 依赖关系必须保持
+**为什么 findings 必须带 reducer**：多个并行 executor 同时返回写 state，普通字段会触发  
+写冲突（InvalidUpdateError）；reducer（`operator.add`）把并发更新定义为"追加合并"。  
+**为什么 plan 不能用 reducer**：计划需要"整表替换"语义而非追加，且 DAG 依赖关系必须保持  
 一致视图——所以它只能由单个顺序节点独占写。
 
 ## 7. Tool 设计
 
-工具契约：name + description + args_schema（Pydantic）→ 供 LLM tool calling；实现为
-**纯函数**（不调 LLM、无副作用）；**错误以返回值（观察结果）回传而非抛异常**——让 LLM
+工具契约：name + description + args_schema（Pydantic）→ 供 LLM tool calling；实现为  
+**纯函数**（不调 LLM、无副作用）；**错误以返回值（观察结果）回传而非抛异常**——让 LLM  
 有机会看到错误、改参数重试（自我纠正的前提）。
 
-| 工具 | 职责 | 引入 |
-|---|---|---|
-| parse_document | 文本 → 条款树（结构化信息用解析器确定性获取，绝不让 LLM 从纯文本里抽） | Phase 1 |
-| locate_clause / read_clause | 条号 → 定位与切片（context 管理的基础） | Phase 2 |
-| clause_cross_ref | 交叉引用一致性核对（确定性正则，不是 LLM） | Phase 2 |
-| risk_kb_search | 审查要点库检索（RAG） | Phase 4 |
-| amount_consistency_check | 金额/日期一致性粗筛（召回型工具，报告中须明示其误报边界） | Phase 5 |
+| 工具                          | 职责                                      | 引入      |
+| --------------------------- | --------------------------------------- | ------- |
+| parse_document              | 文本 → 条款树（结构化信息用解析器确定性获取，绝不让 LLM 从纯文本里抽） | Phase 1 |
+| locate_clause / read_clause | 条号 → 定位与切片（context 管理的基础）               | Phase 2 |
+| clause_cross_ref            | 交叉引用一致性核对（确定性正则，不是 LLM）                 | Phase 2 |
+| risk_kb_search              | 审查要点库检索（RAG）                            | Phase 4 |
+| amount_consistency_check    | 金额/日期一致性粗筛（召回型工具，报告中须明示其误报边界）           | Phase 5 |
 
 **白名单 🧱**：planner 生成的任务只能引用注册表里的工具名——这是"防乱规划"的第一道闸。
 
@@ -118,56 +188,57 @@ State 是全图唯一的共享黑板，一切动态性都存在这里。**写入
 
 Re-planning 四问（规则 13 逐项回答）：
 
-1. **什么情况重新规划**：① 任务失败且换路径可能成功；② evidence_queue 出现新证据
-   （规划时看不到的 unknown unknowns：附件缺失、阴阳条款）；③ reflection 发现覆盖缺口；
+1. **什么情况重新规划**：① 任务失败且换路径可能成功；② evidence_queue 出现新证据  
+   （规划时看不到的 unknown unknowns：附件缺失、阴阳条款）；③ reflection 发现覆盖缺口；  
    ④ 预算未耗尽且要点库还有未覆盖的核心主题。
-2. **谁触发**：replan_check 是条件边 🧱——**代码**读 State 的信号字段（失败标记/新证据/反思
-   结论）决定"要不要重新规划"；**LLM** 🤖 只决定"追加什么任务"。
-   ⚠️ 触发器是确定性的，内容是概率性的——这是 Workflow 与 Agent 的协作，
+2. **谁触发**：replan_check 是条件边 🧱——**代码**读 State 的信号字段（失败标记/新证据/反思  
+   结论）决定"要不要重新规划"；**LLM** 🤖 只决定"追加什么任务"。  
+   ⚠️ 触发器是确定性的，内容是概率性的——这是 Workflow 与 Agent 的协作，  
    **不要吹成"LLM 自主决定重规划"**。
 3. **State 中保存什么**：plan（含每个任务 status）、findings、evidence_queue、replan_count、step_count。
-4. **如何避免无限循环 / 最大执行步数**：四重护栏——replan_count ≤ 3；任务总数 ≤ 15；
-   **diff 式增量**（只追加新任务，不重排已完成的，任务幂等）；连续两次 replan 无新任务 → 强制收尾。
-   另设 step_count 硬上限（schedule→execute→check 循环 ≤ 30 步），到顶强制进 synthesize
+4. **如何避免无限循环 / 最大执行步数**：四重护栏——replan_count ≤ 3；任务总数 ≤ 15；  
+   **diff 式增量**（只追加新任务，不重排已完成的，任务幂等）；连续两次 replan 无新任务 → 强制收尾。  
+   另设 step_count 硬上限（schedule→execute→check 循环 ≤ 30 步），到顶强制进 synthesize  
    并在报告中标注"审查未完成"。
 
 ## 9. RAG 接入方式
 
-**知识库选择**（继承旧版决策 D7）：自建小型结构化"审查要点库"
-（每条：合同类型 + 条款主题 → 审查要点 + 风险等级 + 关联法条），**不做通用法条语料检索**。
+**知识库选择**（继承旧版决策 D7）：自建小型结构化"审查要点库"  
+（每条：合同类型 + 条款主题 → 审查要点 + 风险等级 + 关联法条），**不做通用法条语料检索**。  
 为什么：可控、可标注 ground truth、可测召回；通用语料噪音大且无法评测。
 
 检索两级，接口抽象为 `Retriever`：
+
 1. **结构化过滤 🧱**：按合同类型/主题精确匹配（Phase 4 先只做这层——确定性、可测试）；
 2. **语义检索**：embedding + 余弦 top-k（Phase 4 进阶选项，换实现不动接口）。
 
-**不用 Qdrant 的理由**：几百条要点的规模，内存中检索足够。不用会怎样？——现在不会怎样，
-这正是不用的原因。面试要能反向讲清"什么时候才需要向量数据库"
+**不用 Qdrant 的理由**：几百条要点的规模，内存中检索足够。不用会怎样？——现在不会怎样，  
+这正是不用的原因。面试要能反向讲清"什么时候才需要向量数据库"  
 （百万级向量、多租户隔离、复杂元数据过滤组合需求）。
 
 ## 10. Reflection 设计
 
 - **位置**：所有任务完成后、报告生成前，插入 reflect 节点 🤖。
-- **检查三件事**：① plan 完成度（有无 failed/skipped 任务）；② 证据率（findings 是否都有
+- **检查三件事**：① plan 完成度（有无 failed/skipped 任务）；② 证据率（findings 是否都有  
   条款定位与依据）；③ 覆盖缺口（要点库核心主题是否都被某任务覆盖）。
-- **输出** verdict（pass / needs_replan + 缺口信号）→ 条件边 🧱 决定进 synthesize 还是回 plan
+- **输出** verdict（pass / needs_replan + 缺口信号）→ 条件边 🧱 决定进 synthesize 还是回 plan  
   （占用 replan 预算）。
-- **失败恢复（另一条线，贯穿执行期）**：工具错误 → 以观察结果返回 executor 🤖 → LLM 改参数
+- **失败恢复（另一条线，贯穿执行期）**：工具错误 → 以观察结果返回 executor 🤖 → LLM 改参数  
   重试一次 → 仍失败标记 task failed，交 replan 判断"换路径还是放弃"。
-- **区分两个概念**：Reflection = 评估结果质量（该不该再做点别的）；Re-planning = 实际修改计划。
+- **区分两个概念**：Reflection = 评估结果质量（该不该再做点别的）；Re-planning = 实际修改计划。  
   反思的输出是重规划的输入之一，但两者不是一回事。
 
 ## 11. Memory 设计
 
 三层，各解决不同问题，**不为"看起来高级"而加层**：
 
-| 层 | 载体 | 解决什么 | 不用会怎样 |
-|---|---|---|---|
-| 短期（工作记忆） | State + 任务切片 | 单次审查内的信息流转 | executor 上下文塞全文 → 膨胀、贵、注意力稀释 |
-| 中期（轨迹持久化） | LangGraph Checkpointer（SqliteSaver） | 断点续跑（thread_id 恢复）、HITL 暂停恢复、全轨迹回放（法律可审计刚需） | 长审查中断即全部重跑；无法人工介入 |
-| 长期（跨会话） | 审查历史 sqlite 表 | 历史风险模式 | **MVP 明确不做**，Phase 8 再评估是否纳入 |
+| 层         | 载体                                  | 解决什么                                        | 不用会怎样                        |
+| --------- | ----------------------------------- | ------------------------------------------- | ---------------------------- |
+| 短期（工作记忆）  | State + 任务切片                        | 单次审查内的信息流转                                  | executor 上下文塞全文 → 膨胀、贵、注意力稀释 |
+| 中期（轨迹持久化） | LangGraph Checkpointer（SqliteSaver） | 断点续跑（thread_id 恢复）、HITL 暂停恢复、全轨迹回放（法律可审计刚需） | 长审查中断即全部重跑；无法人工介入            |
+| 长期（跨会话）   | 审查历史 sqlite 表                       | 历史风险模式                                      | **MVP 明确不做**，Phase 8 再评估是否纳入 |
 
-context 管理核心手段：executor 每个任务只带"相关条款切片 + 检索到的要点"，不带全文；
+context 管理核心手段：executor 每个任务只带"相关条款切片 + 检索到的要点"，不带全文；  
 全量信息存 State，由报告层汇总。
 
 ## 12. 项目目录结构（目标态）
@@ -181,7 +252,7 @@ LexAudit Agent/
 │   ├── nodes/                 # Phase 5 起：planner/executor/observer/reflector/reporter
 │   ├── tools/                 # Phase 1 起：parse_document → registry → 其余工具
 │   ├── rag/                   # Phase 4：要点库 + 检索
-│   ├── runtime.py             # Phase 1：LLM 注入点（MockLLM 起步）
+│   ├── llm.py                 # Phase 1：LLM 接入层（OpenAI 兼容协议）
 │   └── report.py              # Phase 5+：报告渲染
 ├── api/                       # Phase 9：FastAPI 薄层
 ├── tests/                     # 每阶段配套 pytest
@@ -195,31 +266,33 @@ LexAudit Agent/
 
 ## 13~15. 开发阶段划分 + 每阶段学习目标 + 面试知识
 
-沿用 Phase 0~10 划分，仅两处调整，理由如下：
-① 不设"文档解析"独立阶段——解析作为 Phase 1/2 的工具顺势引入（没有文档就没有审查对象，
-独立成阶段会推迟你看到第一个 Agent Loop）；
+沿用 Phase 0~10 划分，仅两处调整，理由如下：  
+① 不设"文档解析"独立阶段——解析作为 Phase 1/2 的工具顺势引入（没有文档就没有审查对象，  
+独立成阶段会推迟你看到第一个 Agent Loop）；  
 ② 并行执行（Send）并入 Phase 5 Planning——它是 plan-execute 范式的自然组成部分，单独成阶段反而割裂。
 
-| Phase | 核心问题 | 交付物 | 学习目标 | 面试考点 |
-|---|---|---|---|---|
-| 0 蓝图 | 为什么这么设计 | 本文 | 三范式区别；"动态性"的真实含义 | Plan-Execute vs ReAct vs Workflow |
-| 1 最小 Agent Loop | 循环怎么转起来 | 单循环图：LLM→parse_document→观察→LLM→END | State / 节点 / 条件边 / 循环退出 | LangGraph 执行模型；"loop 不是 while" |
-| 2 Tool Calling | LLM 怎么选工具 | locate/read/cross_ref 工具 | tool schema、观察结果、代码 vs LLM 边界 | function calling 原理；"错误当观察" |
-| 3 Tool Registry | 工具怎么管理 | 注册表 + 白名单 | 解耦与扩展；统一错误处理 | 为什么白名单是防乱规划第一道闸 |
-| 4 RAG Tool | 审查依据从哪来 | risk_kb_search | 分块-检索-注入三步；检索质量评估 | 为什么自建要点库；何时才需要向量库 |
-| 5 Planning | 计划从哪来 | planner+executor 拆分；DAG 入 State；Send 并行 | DAG、reducer 写入纪律 | 动态性 = 状态驱动路由（不是动态图） |
-| 6 Re-planning | 计划怎么变 | observer + replan_check 三岔路由 | 反馈闭环；死循环防护 | replan 触发器；diff 式追加 |
-| 7 Reflection | 结果可信吗 | reflect 节点 + 证据校验 + 失败恢复 | 反思 vs 重规划 | 错误恢复机制设计 |
-| 8 Memory | 状态怎么存续 | SqliteSaver + context 管理 | checkpoint / thread_id | 为什么用 Checkpointer 而不是自己存 |
-| 9 工程化 | 别人怎么用 | FastAPI 薄层 + 异常 + 日志 + 后台任务 | 适配层与 core 解耦 | 为什么薄 API 层；依赖方向 |
+| Phase           | 核心问题      | 交付物                                | 学习目标                          | 面试考点                              |
+| --------------- | --------- | ---------------------------------- | ----------------------------- | --------------------------------- |
+| 0 蓝图            | 为什么这么设计   | 本文                                 | 三范式区别；"动态性"的真实含义              | Plan-Execute vs ReAct vs Workflow |
+| 1 最小 Agent Loop | 循环怎么转起来   | 单循环图：LLM→parse_document→观察→LLM→END | State / 节点 / 条件边 / 循环退出       | LangGraph 执行模型；"loop 不是 while"    |
+| 2 Tool Calling  | LLM 怎么选工具 | locate/read/cross_ref 工具           | tool schema、观察结果、代码 vs LLM 边界 | function calling 原理；"错误当观察"       |
+| 3 Tool Registry | 工具怎么管理    | 注册表 + 白名单                          | 解耦与扩展；统一错误处理                  | 为什么白名单是防乱规划第一道闸                   |
+| 4 RAG Tool      | 审查依据从哪来   | risk_kb_search                     | 分块-检索-注入三步；检索质量评估             | 为什么自建要点库；何时才需要向量库                 |
+
+
+| 5 Planning | 计划从哪来 | planner+executor 拆分；DAG 入 State；Send 并行 | DAG、reducer 写入纪律 | 动态性 = 状态驱动路由（不是动态图） |  
+| 6 Re-planning | 计划怎么变 | observer + replan_check 三岔路由 | 反馈闭环；死循环防护 | replan 触发器；diff 式追加 |  
+| 7 Reflection | 结果可信吗 | reflect 节点 + 证据校验 + 失败恢复 | 反思 vs 重规划 | 错误恢复机制设计 |  
+| 8 Memory | 状态怎么存续 | SqliteSaver + context 管理 | checkpoint / thread_id | 为什么用 Checkpointer 而不是自己存 |  
+| 9 工程化 | 别人怎么用 | FastAPI 薄层 + 异常 + 日志 + 后台任务 | 适配层与 core 解耦 | 为什么薄 API 层；依赖方向 |  
 | 10 评测 | 怎么证明好 | 三版本对比 eval + ground truth 测试集 | 指标设计 | 怎么证明你的 Agent 比裸 LLM 好 |
 
 每阶段结束：独立 git commit（Phase 1 起步先 `git init`）+ 知识检查 + **停止等你确认**。
 
 ## 附：与项目一的对照（面试必讲）
 
-| | 项目一（电商问数） | 本项目（LexAudit） |
-|---|---|---|
-| 范式 | 固定 workflow（图开发期固化） | Plan-and-Execute（计划运行时生成） |
-| 适合场景 | 流程确定、追求可控 | 流程不确定、需要自主 |
-| 共用点 | 同一框架 LangGraph——证明你理解的是框架原语，不是只会一个用法 |
+|      | 项目一（电商问数）                            | 本项目（LexAudit）             |
+| ---- | ------------------------------------ | ------------------------- |
+| 范式   | 固定 workflow（图开发期固化）                  | Plan-and-Execute（计划运行时生成） |
+| 适合场景 | 流程确定、追求可控                            | 流程不确定、需要自主                |
+| 共用点  | 同一框架 LangGraph——证明你理解的是框架原语，不是只会一个用法 |                           |

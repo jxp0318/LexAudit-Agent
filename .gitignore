@@ -1,0 +1,14 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+
+# 旧版归档（只读参考，不进版本库）
+archive/
+
+# WorkBuddy 项目记忆（会话内部数据）
+.workbuddy/
